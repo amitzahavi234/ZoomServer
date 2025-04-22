@@ -9,6 +9,7 @@ using System.Net.Mail;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace ZoomServer
 {
@@ -67,7 +68,9 @@ namespace ZoomServer
         /// <param name="messageFromClient"></param>
         public void HandleCommand(string messageFromClient)
         {
+            Debug.WriteLine($"[CommandHandlerForSingleUser] Handling command: {messageFromClient}");
             ClientServerProtocol clientServerProtocol = new ClientServerProtocol(messageFromClient);
+            Debug.WriteLine($"[CommandHandlerForSingleUser] Command type: {clientServerProtocol.TypeOfCommand}");
             switch (clientServerProtocol.TypeOfCommand)
             {
                 case TypeOfCommandenum.Login_Command:
@@ -93,15 +96,16 @@ namespace ZoomServer
                     break;
 
                 case TypeOfCommandenum.Send_Message_Command:
+                    Debug.WriteLine($"[CommandHandlerForSingleUser] Sending message: {clientServerProtocol.MessageThatTheUserSent}");
                     this.HandleSendMessage(clientServerProtocol.MessageThatTheUserSent, clientServerProtocol.ChatRoomId);
                     break;
 
-               
+
 
                 case TypeOfCommandenum.Get_Messages_History_Of_Chat_Room_Command:
                     this.HandleGetMessagesHistoryOfChatRoom(clientServerProtocol.ChatRoomId);
                     break;
-                
+
 
 
 
@@ -128,64 +132,64 @@ namespace ZoomServer
         /// </summary>
         /// <param name="username"></param>
         /// <param name="password"></param>
-      private void HandleLogin(string username, string password)
-    {
-    string hashPassword = CommandHandlerForSingleUser.CreateSha256(password);
-    this._userId = this._sqlConnect.GetUserId(username, hashPassword);
-
-    if (this._userId <= 0)
-    {
-        this._countLoginFailures++;
-        ClientServerProtocol protocol = new ClientServerProtocol();
-
-        if (this._countLoginFailures >= MAX_NUMBER_OF_LOGIN_FAILED_ATTEMPTS)
+        private void HandleLogin(string username, string password)
         {
-            protocol.TypeOfCommand = TypeOfCommandenum.Login_Cooldown_Command;
-            protocol.TimeToCooldown = this.CalculateTimeToCooldown(this._countLoginFailures);
-            protocol.ErrorMessage = $"Too many failed attempts to login, please wait {protocol.TimeToCooldown} minutes";
-        }
-        else
-        {
-            protocol.TypeOfCommand = TypeOfCommandenum.Error_Command;
-            protocol.ErrorMessage = "Wrong username or password";
-        }
+            string hashPassword = CommandHandlerForSingleUser.CreateSha256(password);
+            this._userId = this._sqlConnect.GetUserId(username, hashPassword);
 
-        this._connection.SendMessage(protocol.Generate());
-        return;
-    }
+            if (this._userId <= 0)
+            {
+                this._countLoginFailures++;
+                ClientServerProtocol protocol = new ClientServerProtocol();
 
-    this._countLoginFailures = 0;
-    this._username = username;
+                if (this._countLoginFailures >= MAX_NUMBER_OF_LOGIN_FAILED_ATTEMPTS)
+                {
+                    protocol.TypeOfCommand = TypeOfCommandenum.Login_Cooldown_Command;
+                    protocol.TimeToCooldown = this.CalculateTimeToCooldown(this._countLoginFailures);
+                    protocol.ErrorMessage = $"Too many failed attempts to login, please wait {protocol.TimeToCooldown} minutes";
+                }
+                else
+                {
+                    protocol.TypeOfCommand = TypeOfCommandenum.Error_Command;
+                    protocol.ErrorMessage = "Wrong username or password";
+                }
 
-    // שליחת הקוד למייל
-    string email = this._sqlConnect.GetEmail(username);
-    string codeToEmail = this.GetRandomCode();
-    Execute(email, codeToEmail).Wait();
+                this._connection.SendMessage(protocol.Generate());
+                return;
+            }
 
-    ClientServerProtocol codeProtocol = new ClientServerProtocol
-    {
-        TypeOfCommand = TypeOfCommandenum.Code_Sent_To_Email_Command,
-        Code = codeToEmail
-    };
-    this._connection.SendMessage(codeProtocol.Generate());
+            this._countLoginFailures = 0;
+            this._username = username;
 
-    // המתנה קלה כדי לוודא סדר בתקשורת TCP
-    // שליחת פרטי המשתמש (הודעת Success)
-    this._profilePicture = this._sqlConnect.GetProfilePictureByUsername(username);
+            // שליחת הקוד למייל
+            string email = this._sqlConnect.GetEmail(username);
+            string codeToEmail = this.GetRandomCode();
+            Execute(email, codeToEmail).Wait();
 
-    ClientServerProtocol successProtocol = new ClientServerProtocol
-    {
-        TypeOfCommand = TypeOfCommandenum.Success_Connected_To_The_Application_Command,
-        ProfilePicture = this._profilePicture,
-        Username = username,
-        UserId = this._userId
-    };
+            ClientServerProtocol codeProtocol = new ClientServerProtocol
+            {
+                TypeOfCommand = TypeOfCommandenum.Code_Sent_To_Email_Command,
+                Code = codeToEmail
+            };
+            this._connection.SendMessage(codeProtocol.Generate());
 
-    Console.WriteLine("==== Sending Success_Connected_To_The_Application_Command ====");
-    Console.WriteLine("Username: " + successProtocol.Username);
-    Console.WriteLine("UserId: " + successProtocol.UserId);
-    Console.WriteLine("ProfilePicture is null? " + (successProtocol.ProfilePicture == null));
-    Console.WriteLine("ProfilePicture length: " + (successProtocol.ProfilePicture?.Length ?? 0));
+            // המתנה קלה כדי לוודא סדר בתקשורת TCP
+            // שליחת פרטי המשתמש (הודעת Success)
+            this._profilePicture = this._sqlConnect.GetProfilePictureByUsername(username);
+
+            ClientServerProtocol successProtocol = new ClientServerProtocol
+            {
+                TypeOfCommand = TypeOfCommandenum.Success_Connected_To_The_Application_Command,
+                ProfilePicture = this._profilePicture,
+                Username = username,
+                UserId = this._userId
+            };
+
+            Console.WriteLine("==== Sending Success_Connected_To_The_Application_Command ====");
+            Console.WriteLine("Username: " + successProtocol.Username);
+            Console.WriteLine("UserId: " + successProtocol.UserId);
+            Console.WriteLine("ProfilePicture is null? " + (successProtocol.ProfilePicture == null));
+            Console.WriteLine("ProfilePicture length: " + (successProtocol.ProfilePicture?.Length ?? 0));
             // המרת התמונה ל־Base64 בלי שבירת שורות
             string base64Picture = Convert.ToBase64String(successProtocol.ProfilePicture, Base64FormattingOptions.None);
 
@@ -199,12 +203,12 @@ namespace ZoomServer
                 .ToString();
 
             this._connection.SendMessage(messageToSend);
-            
+
 
             // יצירת לוג
             this._logger = UserLogger.GetLoggerForUser(username);
-    this._logger.Info("Successfully logged in");
-}
+            this._logger.Info("Successfully logged in");
+        }
 
 
         /// <summary>
@@ -345,8 +349,8 @@ namespace ZoomServer
             }
         }
 
-        
-        
+
+
 
 
         /*private void SendEmail(string email, string code)
@@ -503,11 +507,11 @@ namespace ZoomServer
             RoomsManager.GetChatRoomHistory(this._userId, chatRoomId);
         }
 
-       
 
 
 
 
-        
+
+
     }
 }

@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace ZoomServer
 {
@@ -19,7 +20,7 @@ namespace ZoomServer
         /// <param name="args">arguments</param>
         static void Main(string[] args)
         {
-
+            Sqlconnect.GetInstance().CreateDbSchemaIfDoesNotExist();
 
             TcpListener listener = new TcpListener(IPAddress.Any, portNo);
 
@@ -28,7 +29,7 @@ namespace ZoomServer
 
             // Start listen to incoming connection requests
             listener.Start();
-
+            Debug.WriteLine($"[Program] Server started listening on port {portNo}.");
 
             // infinit loop.
             while (true)
@@ -41,7 +42,11 @@ namespace ZoomServer
                 // server multiple client at the same time.
                 try
                 {
-                  ZoomClientConnection user = new ZoomClientConnection(listener.AcceptTcpClient());
+                    TcpClient tcpClient = listener.AcceptTcpClient();
+                    Debug.WriteLine($"[Program] Client connected from {tcpClient.Client.RemoteEndPoint}, on socket {tcpClient.Client.SocketType}");
+                    // Create a new ZoomClientConnection instance for each accepted client
+                    // This will handle the connection and communication with the client
+                    ZoomClientConnection user = new ZoomClientConnection(tcpClient);
                 }
                 catch (Exception)
                 {

@@ -12,7 +12,9 @@ namespace ZoomServer
         /// <summary>
         /// Contains the AES key and Iv, used for encryption and decryption.
         /// </summary>
-        public static SymmetricKeyBundle EncryptionData;
+       //DU: This is wrong, key should never be static as it changes from connection to connection
+        // public static SymmetricKeyBundle EncryptionData;
+       
 
         /// <summary>
         /// Static constructor that generates a new AES key and IV and assigns them to the <see cref="EncryptionData"/> property.
@@ -23,9 +25,9 @@ namespace ZoomServer
             {
                 aes.GenerateKey();
                 aes.GenerateIV();
-                EncryptionData = new SymmetricKeyBundle();
-                EncryptionData.Key = aes.Key;
-                EncryptionData.Iv = aes.IV;
+                //EncryptionData = new SymmetricKeyBundle();
+                //EncryptionData.Key = aes.Key;
+                //EncryptionData.Iv = aes.IV;
             }
         }
 
@@ -34,15 +36,15 @@ namespace ZoomServer
         /// </summary>
         /// <param name="plainText">The plain text string to encrypt.</param>
         /// <exception cref="ArgumentNullException">Thrown if <paramref name="plainText"/> is null or empty.</exception>
-        public static string EncodeText(string plainText)
+        public static string EncodeText(string plainText, SymmetricKeyBundle encryptionData)
         {
             if (string.IsNullOrEmpty(plainText))
                 throw new ArgumentNullException(nameof(plainText));
 
             using (Aes aes = Aes.Create())
             {
-                aes.Key = EncryptionData.Key;
-                aes.IV = EncryptionData.Iv;
+                aes.Key = encryptionData.Key;
+                aes.IV = encryptionData.Iv;
 
                 ICryptoTransform encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
 
@@ -63,7 +65,7 @@ namespace ZoomServer
         /// </summary>
         /// <param name="cipherText">The Base64-encoded string to decrypt.</param>
         /// <exception cref="ArgumentNullException">Thrown if <paramref name="cipherText"/> is null or empty.</exception>
-        public static string DecodeText(string cipherText)
+        public static string DecodeText(string cipherText, SymmetricKeyBundle encryptionData)
         {
             if (string.IsNullOrEmpty(cipherText))
                 throw new ArgumentNullException(nameof(cipherText));
@@ -73,8 +75,8 @@ namespace ZoomServer
 
             using (Aes aes = Aes.Create())
             {
-                aes.Key = EncryptionData.Key;
-                aes.IV = EncryptionData.Iv;
+                aes.Key = encryptionData.Key;
+                aes.IV = encryptionData.Iv;
 
                 ICryptoTransform decryptor = aes.CreateDecryptor(aes.Key, aes.IV);
 

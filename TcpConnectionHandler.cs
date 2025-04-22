@@ -1,237 +1,289 @@
-﻿using NLog;
+﻿// ZoomServer/TcpConnectionHandler.cs - Modified
+using NLog;
 using System;
-using System.Collections.Generic;
+using System.Diagnostics; // For Debug.WriteLine
 using System.IO;
-using System.Linq;
+using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography; // For CryptographicException
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace ZoomServer
 {
-
     public class TcpConnectionHandler
     {
-        /// <summary>
-        /// Length of the current message being read from the client.
-        /// </summary>
         private int messageLength = -1;
-
-        /// <summary>
-        /// Total number of bytes read from the current message.
-        /// </summary>
         private int totalBytesRead = 0;
-
-
-        /// <summary>
-        /// Indicates if the first message has been received from the client.
-        /// </summary>
-        private bool _isFirstMessage = true;
-
-
-        /// <summary>
-        /// Buffer for reading data from the client.
-        /// </summary>
+        // REMOVED: private bool _isFirstMessage = true; // State now managed by ZoomClientConnection
         private byte[] _data;
-
-        /// <summary>
-        /// Memory stream used for assembling incoming message data.
-        /// </summary>
         private MemoryStream memoryStream = new MemoryStream();
-
-
-        /// <summary>
-        /// The TCP client representing the connection.
-        /// </summary>
         private TcpClient _client;
+        // Store the owner connection
+        private ZoomClientConnection _ownerConnection; // Renamed for clarity
 
-        private ZoomClientConnection ZoomClientConnection;
-
-
-        public TcpConnectionHandler(TcpClient tcpClient, ZoomClientConnection ZoomClientConnection)
+        public TcpConnectionHandler(TcpClient tcpClient, ZoomClientConnection ownerConnection) // Renamed parameter
         {
             this._client = tcpClient;
-            this.ZoomClientConnection = ZoomClientConnection;
-            // Read data from the client asynchronously
+            this._ownerConnection = ownerConnection; // Store the owner
             this._data = new byte[this._client.ReceiveBufferSize];
-
         }
 
         public void StartListen()
         {
-            // Begin async read from the NetworkStream
-            _client.GetStream().BeginRead(this._data,
-                                          0,
-                                          System.Convert.ToInt32(this._client.ReceiveBufferSize),
-                                          ReceiveMessage,
-                                          _client.GetStream());
-
-        }
-
-
-
-        /// <summary>
-        /// The function convert the string that we want to send to the server into byte array and send it to the server over the tcp connection
-        /// </summary>
-        /// <param name="message"></param>
-        public void SendMessage(string message)
-        {
-            Console.WriteLine(message);
             try
             {
-                // send message to the server
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Starting async read."); // Use owner's IP for logging
+                _client.GetStream().BeginRead(this._data, 0, System.Convert.ToInt32(this._client.ReceiveBufferSize),
+                                              ReceiveMessage, _client.GetStream());
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException || ex is InvalidOperationException)
+            {
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Error starting listen (connection likely closed): {ex.Message}");
+                this._ownerConnection.HandleDisconnect(); // Ensure cleanup if start fails
+            }
+        }
 
-                NetworkStream ns;
+        public void SendMessage(string message)
+        {
+            // Determine if this is the AES key bundle being sent (first logical message from server)
+            // A more robust check might be needed if other JSON messages are sent unencrypted early.
+            bool isSendingAesKey = !_ownerConnection.IsHandshakeComplete && message.Contains("\"Key\":");
 
-                // Use lock to prevent multiple threads from accessing the network stream simultaneously
-                lock (this._client.GetStream())
+            try
+            {
+                NetworkStream ns = _client.GetStream(); // Get stream inside try
+                string encryptedMessage;
+
+                if (isSendingAesKey)
                 {
-                    ns = this._client.GetStream();
+                    // Encrypt the AES key bundle using the specific client's RSA public key
+                    Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Sending AES Key (Plaintext JSON): {message}");
+                    encryptedMessage = RsaFunctions.Encrypt(message, _ownerConnection.ClientRsaPublicKey);
+                    Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Sending AES Key (RSA Encrypted): {encryptedMessage}");
+                }
+                else // Subsequent messages use AES
+                {
+                    // Ensure handshake is complete and AES key exists before encrypting
+                    if (!_ownerConnection.IsHandshakeComplete || _ownerConnection.SessionAesKeyBundle == null)
+                    {
+                        Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Cannot send message - handshake not complete or AES key missing.");
+                        return;
+                    }
+                    Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Sending message (Plaintext): {message}");
+                    // Encrypt using the session-specific AES key
+                    encryptedMessage = SymmetricEncryptionManager.EncodeText(message, _ownerConnection.SessionAesKeyBundle);
+                    Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Sending message (AES Encrypted): {encryptedMessage}");
                 }
 
-                if (this._isFirstMessage)
-                {
-                    message = RsaFunctions.Encrypt(message);
-                }
-                else
-                {
-                    message = SymmetricEncryptionManager.EncodeText(message);
-                }
-
-                byte[] data = System.Text.Encoding.UTF8.GetBytes(message);
+                byte[] data = Encoding.UTF8.GetBytes(encryptedMessage);
                 byte[] length = BitConverter.GetBytes(data.Length);
-                byte[] bytes = new byte[data.Length + 4];
-                // combine byte array, I took this code from the website StackOverFlow in this link:
-                // https://stackoverflow.com/questions/415291/best-way-to-combine-two-or-more-byte-arrays-in-c-sharp
-                System.Buffer.BlockCopy(length, 0, bytes, 0, length.Length);
-                System.Buffer.BlockCopy(data, 0, bytes, length.Length, data.Length);
+                byte[] bytesToSend = new byte[data.Length + 4];
 
-                // send the text
-                ns.Write(bytes, 0, bytes.Length);
+                Buffer.BlockCopy(length, 0, bytesToSend, 0, length.Length);
+                Buffer.BlockCopy(data, 0, bytesToSend, length.Length, data.Length);
+
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Writing {bytesToSend.Length} bytes to network stream.");
+                // Consider using BeginWrite/EndWrite for async sending if this becomes a bottleneck
+                ns.Write(bytesToSend, 0, bytesToSend.Length);
                 ns.Flush();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is IOException || ex is ObjectDisposedException)
+            {
+                // Catch common network errors during send
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Network error sending message: {ex.Message}");
+                this._ownerConnection.HandleDisconnect(); // Trigger cleanup
+            }
+            catch (CryptographicException cryptoEx)
+            {
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Encryption error sending message: {cryptoEx.Message}");
+                // Decide how to handle - maybe close connection?
+                this._ownerConnection.HandleDisconnect();
             }
             catch (Exception ex)
             {
-                Console.WriteLine(ex.ToString());
+                // Catch unexpected errors
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Unexpected error sending message: {ex.Message}");
+                this._ownerConnection.HandleDisconnect();
             }
         }
 
-
-        /// <summary>
-        /// Receives a message from the client asynchronously and processes it when complete.
-        /// </summary>
-        /// <param name="ar"></param>
         private void ReceiveMessage(IAsyncResult ar)
         {
-            NetworkStream stream = (NetworkStream)ar.AsyncState;
+            NetworkStream stream;
+            IPEndPoint clientIP = _ownerConnection.ClientIP;
+            string clientIPString = clientIP != null ? clientIP.ToString() : "Unknown";
+            try
+            {
+                stream = (NetworkStream)ar.AsyncState;
+
+                if (!_client.Connected || stream == null)
+                {
+                    Debug.WriteLine($"[TcpConnectionHandler] [{clientIPString}] ReceiveMessage callback invoked but client not connected/stream null.");
+                    _ownerConnection?.HandleDisconnect();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[TcpConnectionHandler] [{clientIPString}] Error getting NetworkStream in ReceiveMessage: {ex.Message}");
+                _ownerConnection?.HandleDisconnect();
+                return;
+            }
+
 
             try
             {
                 int bytesRead = stream.EndRead(ar);
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Read {bytesRead} bytes from network stream.");
 
                 if (bytesRead > 0)
                 {
                     HandleReceivedMessage(bytesRead);
 
-                    lock (this._client.GetStream())
+                    // Continue reading ONLY if the client is still connected
+                    if (_client.Connected)
                     {
-                        this._client.GetStream().BeginRead(this._data, 0, this._client.ReceiveBufferSize,
-                            ReceiveMessage, _client.GetStream());
+                        stream.BeginRead(this._data, 0, this._client.ReceiveBufferSize,
+                                         ReceiveMessage, stream);
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Client disconnected during read cycle.");
+                        _ownerConnection.HandleDisconnect();
                     }
                 }
-                else
+                else // bytesRead == 0 means graceful disconnect
                 {
-                    // אם bytesRead == 0 → החיבור נסגר בצורה תקינה
-                    Console.WriteLine("Client disconnected gracefully.");
-                    ZoomClientConnection.HandleDisconnect(); // אם יש
-                    this.Close();
+                    Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Client disconnected gracefully (0 bytes read).");
+                    _ownerConnection.HandleDisconnect();
+                    this.Close(); // Close handler resources
                 }
             }
-            catch (IOException ioEx)
+            catch (Exception ex) when (ex is IOException || ex is ObjectDisposedException || ex is InvalidOperationException)
             {
-                Console.WriteLine("Connection closed by remote host: " + ioEx.Message);
-                ZoomClientConnection.HandleDisconnect(); // טיפוסי
+                // Common network/stream errors during read
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Network/Stream error receiving message: {ex.Message}");
+                _ownerConnection.HandleDisconnect();
                 this.Close();
-            }
-            catch (ObjectDisposedException)
-            {
-                Console.WriteLine("Stream already disposed. Ignoring...");
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Unexpected error while receiving message: " + ex.Message);
-                ZoomClientConnection.HandleDisconnect(); // אפשרי
+                // Unexpected errors during read
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Unexpected error receiving message: {ex.Message}");
+                _ownerConnection.HandleDisconnect();
                 this.Close();
             }
         }
-      
 
         private void HandleReceivedMessage(int bytesRead)
         {
-            // If message length is not set, read the first 4 bytes for message length
-            if (this.messageLength == -1 && this.totalBytesRead < 4)
-            {
-                int remainingLengthBytes = 4 - this.totalBytesRead;
-                int bytesToCopy = Math.Min(bytesRead, remainingLengthBytes);
-                memoryStream.Write(this._data, 0, bytesToCopy);
-                this.totalBytesRead += bytesToCopy;
-                // Check if we have read the full length header
-                if (this.totalBytesRead >= 4)
-                {
-                    // Move the memory stream's read pointer to the beginning 
-                    this.memoryStream.Seek(0, SeekOrigin.Begin);
-                    byte[] lengthBytes = new byte[4];
-                    // Read 4 bytes from the memory stream into lengthBytes
-                    this.memoryStream.Read(lengthBytes, 0, 4);
-                    this.messageLength = BitConverter.ToInt32(lengthBytes, 0);
-                    // Reset memory stream to accumulate the rest of the message
-                    this.memoryStream.SetLength(0);
-                }
+            // Pass processing logic directly to ZoomClientConnection instance
+            // The framing logic needs to handle partial reads correctly.
+            // This implementation assumes framing logic is sound, but needs careful testing.
 
-                // If there’s more data in this chunk, process it as part of the message body
-                if (bytesRead > bytesToCopy)
+            try
+            {
+                // Append received data to the memory stream
+                memoryStream.Write(this._data, 0, bytesRead);
+
+                // Process messages as long as enough data is available
+                while (true)
                 {
-                    this.memoryStream.Write(this._data, bytesToCopy, bytesRead - bytesToCopy);
-                    this.totalBytesRead += bytesRead - bytesToCopy;
+                    if (messageLength == -1) // Need to read length prefix
+                    {
+                        if (memoryStream.Length >= 4)
+                        {
+                            memoryStream.Position = 0;
+                            byte[] lengthBytes = new byte[4];
+                            memoryStream.Read(lengthBytes, 0, 4);
+                            messageLength = BitConverter.ToInt32(lengthBytes, 0);
+
+                            // Basic sanity check for message length
+                            if (messageLength < 0 || messageLength > 10 * 1024 * 1024) // e.g., 10MB limit
+                            {
+                                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Invalid message length received: {messageLength}. Closing connection.");
+                                Close();
+                                return;
+                            }
+
+
+                            Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Expecting message length: {messageLength}");
+
+                            // Remove length prefix from stream buffer
+                            byte[] remainingData = new byte[memoryStream.Length - 4];
+                            memoryStream.Read(remainingData, 0, remainingData.Length);
+                            memoryStream.SetLength(0);
+                            memoryStream.Write(remainingData, 0, remainingData.Length);
+                        }
+                        else
+                        {
+                            // Not enough data for length prefix yet
+                            break;
+                        }
+                    }
+
+                    // Check if we have the complete message body
+                    if (messageLength != -1 && memoryStream.Length >= messageLength)
+                    {
+                        byte[] messageBytes = new byte[messageLength];
+                        memoryStream.Position = 0;
+                        memoryStream.Read(messageBytes, 0, messageLength);
+
+                        Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Full message received ({messageLength} bytes). Processing...");
+                        // Determine if it's the first message based on handshake state
+                        bool isFirstLogicalMessage = !_ownerConnection.IsHandshakeComplete && _ownerConnection.SessionAesKeyBundle == null;
+                        _ownerConnection.ProcessMessage(messageBytes, messageLength, isFirstLogicalMessage);
+
+
+                        // Remove processed message from stream buffer
+                        byte[] remainingData = new byte[memoryStream.Length - messageLength];
+                        memoryStream.Position = messageLength; // Set position after the read message
+                        memoryStream.Read(remainingData, 0, remainingData.Length);
+                        memoryStream.SetLength(0); // Clear the stream
+                        memoryStream.Write(remainingData, 0, remainingData.Length); // Write back remaining data
+
+
+                        // Reset for next message
+                        messageLength = -1;
+
+                        // Check if owner closed the connection during processing
+                        if (!_client.Connected) break;
+                    }
+                    else
+                    {
+                        // Not enough data for message body yet
+                        break;
+                    }
                 }
+                // Set position back to the end for future writes
+                memoryStream.Position = memoryStream.Length;
             }
-            else
+            catch (Exception ex)
             {
-                // Accumulate message data into memory stream
-                this.memoryStream.Write(this._data, 0, bytesRead);
-                this.totalBytesRead += bytesRead;
-            }
-
-            // If we've accumulated the full message, process it
-            if (this.messageLength > 0 && this.totalBytesRead >= this.messageLength + 4)
-            {
-                this.ZoomClientConnection.ProcessMessage(this.memoryStream.ToArray(), this.messageLength,
-                    this._isFirstMessage);
-                this._isFirstMessage = false;
-
-                //At this point the memory stream can contain more messages
-                int remainingDataBytes = this.totalBytesRead - (this.messageLength + 4);
-
-
-                // Reset properties for the next message
-                this.messageLength = -1;
-                this.totalBytesRead = 0;
-                this.memoryStream.SetLength(0);
-
-                if (remainingDataBytes > 0) //Handle the next message, if we have one
-                {
-                    byte[] newData = new byte[this._client.ReceiveBufferSize];
-                    Array.Copy(this._data, bytesRead - remainingDataBytes, newData, 0, remainingDataBytes);
-                    this._data = newData;
-                    HandleReceivedMessage(remainingDataBytes);
-                }
+                Debug.WriteLine($"[TcpConnectionHandler] [{this._ownerConnection.ClientIP}] Error handling received message buffer: {ex.Message}");
+                _ownerConnection.HandleDisconnect();
+                Close();
             }
         }
 
+
         public void Close()
         {
-            this._client.Close();
+            string clientIPString = _ownerConnection?.ClientIP != null ? _ownerConnection.ClientIP.ToString() : "Unknown";
+            try
+            {
+                Debug.WriteLine($"[TcpConnectionHandler] [{clientIPString}] Closing TcpConnectionHandler.");
+                if (_client?.Connected ?? false) // Check if client exists and is connected
+                {
+                    _client.Close();
+                }
+                memoryStream?.Dispose(); // Dispose the memory stream
+            }
+            catch (Exception ex)
+            {
+                // Log errors during close, but don't let them prevent cleanup
+                Debug.WriteLine($"[TcpConnectionHandler] [{clientIPString}] Error during TcpConnectionHandler close: {ex.Message}");
+            }
         }
     }
 }
